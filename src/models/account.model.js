@@ -30,7 +30,7 @@ accountSchema.methods.getBalance = async function() {
         { $match: { account: this._id } },
         { $group:{
             _id: null,
-            totolDebit: {
+            totalDebit: {
                 $sum: {
                     $cond: [{ $eq: ['$type', 'debit'] }, '$amount', 0 ]
                 }
