@@ -15,4 +15,21 @@ const router = express.Router();
 
 router.post('/', authMiddleware.authMiddleware, accountController.createAccount);
 
+/**
+ * @route GET /api/accounts
+ * @desc Get all accounts for the authenticated user
+ * @access Protected Route
+ * @access Private
+ */
+router.get('/', authMiddleware.authMiddleware, accountController.getUserAccountsController);
+
+/**
+ * @route GET /api/accounts/:accountId
+ * @desc Get Account balance and details for the authenticated user
+ * @access Protected Route
+ * @access Private
+ */
+router.get('/:accountId', authMiddleware.authMiddleware, accountController.getAccountBalanceController);
+
+
 module.exports = router; 

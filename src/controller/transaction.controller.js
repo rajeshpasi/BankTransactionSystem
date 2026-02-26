@@ -3,11 +3,48 @@ const accountModel = require('../models/account.model');
 const ledgerModel = require('../models/ledger.model');
 const emailService = require('../services/email.service');
 const mongoose = require('mongoose');
+const transactionModel = require('../models/transaction.model');
+
+const isTransactionUnsupportedError = (error) => {
+    return error?.message?.includes('Transaction numbers are only allowed on a replica set member or mongos');
+};
+
+const runWithOptionalTransaction = async (operation) => {
+    let session;
+
+    try {
+        session = await mongoose.startSession();
+        session.startTransaction();
+
+        const result = await operation(session);
+        await session.commitTransaction();
+
+        return result;
+    } catch (error) {
+        if (session) {
+            try {
+                await session.abortTransaction();
+            } catch (abortError) {
+            }
+        }
+
+        if (isTransactionUnsupportedError(error)) {
+            return operation(null);
+        }
+
+        throw error;
+    } finally {
+        if (session) {
+            await session.endSession();
+        }
+    }
+};
 
 
 
 const createTransaction = async (req, res) => {
-    const { fromAccount, toAccount, amount, idmpotencyKey } = req.body;
+    const { fromAccount, toAccount, amount, idmpotencyKey: requestIdmpotencyKey, idempotencyKey } = req.body;
+    const idmpotencyKey = requestIdmpotencyKey || idempotencyKey;
 
         /**
          * Validation: Ensure all required fields are present and valid
@@ -23,8 +60,6 @@ const createTransaction = async (req, res) => {
         if (fromAccount === toAccount) {
             return res.status(400).json({ message: 'Sender and receiver accounts must be different' });
         }
-
-        let session;
 
         try {
 
@@ -90,52 +125,112 @@ const createTransaction = async (req, res) => {
         /**
          * Create a new transaction with status 'pending'
          */
-        session = await mongoose.startSession();
-        session.startTransaction();
+        const transaction = await runWithOptionalTransaction(async (session) => {
+            const sessionOption = session ? { session } : {};
 
-        const [ transaction ] = new transactionSchemaModel([{
-            fromAccount,
-            toAccount,
-            amount,
-            idmpotencyKey,
-            status: 'pending'
-        }], { session });
+            const [ createdTransaction ] = await transactionSchemaModel.create([{
+                fromAccount,
+                toAccount,
+                amount,
+                idmpotencyKey,
+                status: 'pending'
+            }], sessionOption);
 
-        await ledgerModel.create([{
-            account: fromAccount,
-            amount: amount,
-            transaction: transaction._id,
-            type: 'debit'
-        }], { session });
+            await ledgerModel.create([{
+                account: fromAccount,
+                amount: amount,
+                transaction: createdTransaction._id,
+                type: 'debit'
+            }], sessionOption);
 
-        await ledgerModel.create([{
-            account: toAccount,
-            amount: amount,
-            transaction: transaction._id,
-            type: 'credit'
-        }], { session });
+            await ledgerModel.create([{
+                account: toAccount,
+                amount: amount,
+                transaction: createdTransaction._id,
+                type: 'credit'
+            }], sessionOption);
 
-        transaction.status = 'completed';
-        await transaction.save({ session });
+            createdTransaction.status = 'completed';
+            await createdTransaction.save(sessionOption);
 
-        await session.commitTransaction();
-        await session.endSession();
+            return createdTransaction;
+        });
         
        await emailService.sendTransactionEmail(formUserAccount.user.email, formUserAccount.user.name, amount, toAccount);
 
         res.status(201).json({ message: 'Transaction completed successfully', transaction }); 
         } catch (error) {
-            if (session) {
-                await session.abortTransaction();
-                await session.endSession();
-            }
-
             return res.status(500).json({ message: error.message || 'Transaction failed' });
         }
 }
 
-async function createInitialFundsTransaction(req, res) {
-    return res.status(501).json({ message: 'Initial funds transaction is not implemented yet' });
+const createInitialFundsTransaction = async (req, res) => {
+    const { toAccount, amount, idmpotencyKey: requestIdmpotencyKey, idempotencyKey } = req.body
+    const idmpotencyKey = requestIdmpotencyKey || idempotencyKey
+
+    if (!toAccount || !amount || !idmpotencyKey) {
+        return res.status(400).json({
+            message: "toAccount, amount and (idmpotencyKey or idempotencyKey) are required"
+        })
+    }
+
+    const toUserAccount = await accountModel.findOne({
+        _id: toAccount,
+    })
+
+    if (!toUserAccount) {
+        return res.status(400).json({
+            message: "Invalid toAccount"
+        })
+    }
+
+    const fromUserAccount = await accountModel.findOne({
+        user: req.user._id
+    })
+
+    if (!fromUserAccount) {
+        return res.status(400).json({
+            message: "System user account not found"
+        })
+    }
+
+    const transaction = await runWithOptionalTransaction(async (session) => {
+        const sessionOption = session ? { session } : {};
+
+        const [ createdTransaction ] = await transactionModel.create([{
+            fromAccount: fromUserAccount._id,
+            toAccount,
+            amount,
+            idmpotencyKey,
+            status: 'pending'
+        }], sessionOption);
+
+        await ledgerModel.create([ {
+            account: fromUserAccount._id,
+            amount: amount,
+            transaction: createdTransaction._id,
+            type: 'debit'
+        } ], sessionOption);
+
+        await ledgerModel.create([ {
+            account: toAccount,
+            amount: amount,
+            transaction: createdTransaction._id,
+            type: 'credit'
+        } ], sessionOption);
+
+        createdTransaction.status = 'completed';
+        await createdTransaction.save(sessionOption);
+
+        return createdTransaction;
+    })
+
+    return res.status(201).json({
+        message: "Initial funds transaction completed successfully",
+        transaction: transaction
+    })
+
+        
 }
 
 module.exports = {
